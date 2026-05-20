@@ -23,7 +23,10 @@ def generate_snapshots(snapshot_num, geometry_utilities, vtk_utilities, mesh, me
     P = np.array([mu0_range, mu1_range])
     training_set = np.random.uniform(low=P[:, 0], high=P[:, 1], size=(snapshot_num, P.shape[0]))
 
-    snapshot_matrix = []
+    snapshot_matrix_u = []
+    snapshot_matrix_s = [] ### supremizer snapshot
+    snapshot_matrix_p = []
+
     for mu_arr in tqdm(training_set, desc="Generating Snapshots"):
         mu0 = mu_arr[0]
         mu1 = mu_arr[1]
@@ -127,6 +130,10 @@ def generate_snapshots(snapshot_num, geometry_utilities, vtk_utilities, mesh, me
         J_BT_y = other_ut.make_np_sparse(B_y_operator.operator_dofs, [tot_dofs, tot_dofs], [2 * speed_n_dofs, speed_n_dofs], True)
 
         J_S = J_A_x + J_A_y - J_B_x - J_B_y - J_BT_x - J_BT_y
+        X_1 = other_ut.make_np_sparse(A_operator.operator_dofs, [2 * speed_n_dofs, 2 * speed_n_dofs], [0, 0])
+        X_2 = other_ut.make_np_sparse(A_operator.operator_dofs, [2 * speed_n_dofs, 2 * speed_n_dofs], [speed_n_dofs, speed_n_dofs])
+        B_1 = other_ut.make_np_sparse(B_x_operator.operator_dofs, [pressure_n_dofs, 2 * speed_n_dofs], [0, 0])
+        B_2 = other_ut.make_np_sparse(B_y_operator.operator_dofs, [pressure_n_dofs, 2 * speed_n_dofs], [0, speed_n_dofs])
 
         def speed_x_initial_condition(x, y, z):
             return 0.0
@@ -189,7 +196,10 @@ def generate_snapshots(snapshot_num, geometry_utilities, vtk_utilities, mesh, me
 
             u_x_numeric = u_k[0:speed_n_dofs]
             u_y_numeric = u_k[speed_n_dofs:2 * speed_n_dofs]
+            u_numeric = u_k[0:2*speed_n_dofs]
             p_numeric = u_k[2 * speed_n_dofs:]
+
+            
 
             du_x_error_L2 = polydim.pde_tools.assembler_utilities.pcc_2_d.compute_error_l2(geometry_utilities,
                                                                                         mesh,
@@ -250,7 +260,116 @@ def generate_snapshots(snapshot_num, geometry_utilities, vtk_utilities, mesh, me
 
             num_iteration = num_iteration + 1
 
-        snapshot_matrix.append(np.copy(u_k))
+        snapshot_matrix_u.append(np.copy(u_k[0:2*speed_n_dofs]))
+        snapshot_matrix_p.append(np.copy(u_k[2*speed_n_dofs:]))
+        snapshot_s = scipy.sparse.linalg.spsolve(X_1 + X_2, np.transpose(B_1 + B_2) @ u_k[2*speed_n_dofs:])
+        snapshot_matrix_s.append(np.copy(snapshot_s)) 
 
-    snapshot_matrix = np.array(snapshot_matrix)
-    return snapshot_matrix
+    snapshot_matrix_u = np.array(snapshot_matrix_u)
+    snapshot_matrix_s = np.array(snapshot_matrix_s)
+    snapshot_matrix_p = np.array(snapshot_matrix_p)
+    inner_product_u = X_1 + X_2
+    return snapshot_matrix_u,snapshot_matrix_s,snapshot_matrix_p,inner_product_u
+
+"""def eig_analysis(C, N_max=None, tol=1e-9):
+    L_e, VM_e = np.linalg.eig(C)
+    eigenvalues = []
+    eigenvectors = []
+
+    for i in range(len(L_e)):
+        eig_real = L_e[i].real
+        eig_complex = L_e[i].imag
+        assert np.isclose(eig_complex, 0.)
+        eigenvalues.append(eig_real)
+        eigenvectors.append(VM_e[i].real)
+
+
+    total_energy = sum(eigenvalues)
+    retained_energy_vector = np.cumsum(eigenvalues)
+    relative_retained_energy = retained_energy_vector/total_energy
+
+
+    if all(flag==False for flag in relative_retained_energy>= tol) and N_max != None:
+        N = N_max
+    else:
+        N = np.argmax(relative_retained_energy >= (1.0-tol)) + 1
+    
+    return N, eigenvectors"""
+
+def eig_analysis(C, N_max=None, tol=1e-9):
+    L_e, VM_e = np.linalg.eig(C)
+    
+    # 1. Ordina gli autovalori e i relativi autovettori in ordine decrescente
+    idx = np.argsort(L_e.real)[::-1]
+    L_e = L_e[idx]
+    VM_e = VM_e[:, idx]
+
+    eigenvalues = []
+    eigenvectors = []
+
+    for i in range(len(L_e)):
+        eig_real = L_e[i].real
+        eig_complex = L_e[i].imag
+        assert np.isclose(eig_complex, 0.)
+        eigenvalues.append(eig_real)
+        
+        # 2. Gli autovettori sono le COLONNE, non le righe
+        eigenvectors.append(VM_e[:, i].real)
+
+    total_energy = sum(eigenvalues)
+    retained_energy_vector = np.cumsum(eigenvalues)
+    relative_retained_energy = retained_energy_vector / total_energy
+
+    # 3. Logica della tolleranza corretta (1.0 - tol)
+    threshold = 1.0 - tol
+    
+    if all(flag == False for flag in relative_retained_energy >= threshold) and N_max is not None:
+        N = N_max
+    else:
+        N = np.argmax(relative_retained_energy >= threshold) + 1
+    
+    # Rispetta l'eventuale limite imposto da N_max
+    if N_max is not None and N > N_max:
+        N = N_max
+        
+    return N, eigenvectors
+
+def create_basis_functions_matrix(N, snapshot_matrix, eigenvectors, inner_product=None):
+    basis_functions = []
+    
+    for n in range(N):
+        eigenvector =  eigenvectors[n]
+        basis = np.transpose(snapshot_matrix)@eigenvector
+        if inner_product!= None:
+            norm = np.sqrt(np.transpose(basis) @ inner_product @ basis) ## metti inner product
+        else:
+            norm = np.sqrt(np.transpose(basis) @ basis)
+        basis /= norm
+        basis_functions.append(np.copy(basis))
+
+    basis_function_matrix = np.transpose(np.array(basis_functions))
+    
+    return basis_function_matrix
+
+def generate_basis(snapshot_matrix_u,snapshot_matrix_s,snapshot_matrix_p,inner_product_u,N_max,tol):
+    C_u = snapshot_matrix_u @ inner_product_u @ np.transpose(snapshot_matrix_u)
+    C_s = snapshot_matrix_s @ inner_product_u @ np.transpose(snapshot_matrix_s)
+    C_p = snapshot_matrix_p @ np.transpose(snapshot_matrix_p)
+
+    N_u, eigs_u = eig_analysis(C_u, N_max=N_max, tol=tol)
+    N_s, eigs_s = eig_analysis(C_s, N_max=N_max, tol=tol)
+    N_p, eigs_p = eig_analysis(C_p, N_max=N_max, tol=tol)
+
+    basis_functions_u = create_basis_functions_matrix(N_u, snapshot_matrix_u, eigs_u, inner_product=inner_product_u)
+    basis_functions_s = create_basis_functions_matrix(N_s, snapshot_matrix_s, eigs_s, inner_product=inner_product_u)
+    basis_functions_p = create_basis_functions_matrix(N_p, snapshot_matrix_p, eigs_p)
+
+    global_basis_function_matrix = np.zeros((basis_functions_u.shape[0] + basis_functions_p.shape[0],N_u + N_s + N_p))
+    global_basis_function_matrix[0:basis_functions_u.shape[0], 0:N_u] = basis_functions_u
+    global_basis_function_matrix[0:basis_functions_u.shape[0], N_u : N_u + N_s] = basis_functions_s
+    global_basis_function_matrix[basis_functions_u.shape[0]:, N_u + N_s:] = basis_functions_p
+
+    return global_basis_function_matrix
+
+
+    
